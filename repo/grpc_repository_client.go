@@ -22,6 +22,7 @@ import (
 	apipb "github.com/kopia/kopia/internal/grpcapi"
 	"github.com/kopia/kopia/internal/retry"
 	"github.com/kopia/kopia/internal/tlsutil"
+	"github.com/kopia/kopia/internal/wakeevents"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
@@ -86,6 +87,14 @@ type grpcRepositoryClient struct {
 	findManifestsPageSize int32
 
 	recent recentlyRead
+
+	wakeupManager wakeevents.Manager
+
+	sessionMutex sync.Mutex
+	// +checklocks:sessionMutex
+	sessionCtx context.Context
+	// +checklocks:sessionMutex
+	sessionCancel context.CancelFunc
 }
 
 type grpcInnerSession struct {
@@ -106,12 +115,22 @@ type grpcInnerSession struct {
 }
 
 // readLoop runs in a goroutine and consumes all messages in session and forwards them to appropriate channels.
+// It respects context cancellation to allow graceful shutdown even if the GRPC stream is blocked.
 func (r *grpcInnerSession) readLoop(ctx context.Context) {
 	defer r.wg.Done()
 
 	msg, err := r.cli.Recv()
 
 	for ; err == nil; msg, err = r.cli.Recv() {
+		// Check if context was cancelled (e.g., during killInnerSession).
+		// This allows readLoop to exit promptly instead of hanging.
+		select {
+		case <-ctx.Done():
+			log(ctx).Debugf("GRPC stream read loop interrupted by context cancellation")
+			return
+		default:
+		}
+
 		r.activeRequestsMutex.Lock()
 		ch := r.activeRequests[msg.GetRequestId()]
 
@@ -929,8 +948,16 @@ func (r *grpcRepositoryClient) getOrEstablishInnerSession(ctx context.Context) (
 
 		r.innerSessionAttemptCount++
 
-		v, err := retry.WithExponentialBackoff(ctx, "establishing session", func() (*grpcInnerSession, error) {
-			sess, err := cli.Session(context.WithoutCancel(ctx))
+		// Create a cancellable context for the session so it can be interrupted when
+		// killInnerSession is called. This prevents the readLoop from hanging the entire
+		// GRPC client if the connection breaks during sleep/wake.
+		r.sessionCtx, r.sessionCancel = context.WithCancel(context.Background())
+
+		// Use 31 attempts (~10 minutes) when re-establishing a session after a disconnect
+		// (e.g. computer sleep/wake). The Never policy for the initial connection already
+		// limits retries to 1 regardless of this count.
+		v, err := retry.WithExponentialBackoffMaxRetries(ctx, 31, "establishing session", func() (*grpcInnerSession, error) {
+			sess, err := cli.Session(r.sessionCtx)
 			if err != nil {
 				return nil, errors.Wrap(err, "Session()")
 			}
@@ -943,7 +970,7 @@ func (r *grpcRepositoryClient) getOrEstablishInnerSession(ctx context.Context) (
 
 			newSess.wg.Add(1)
 
-			go newSess.readLoop(ctx)
+			go newSess.readLoop(r.sessionCtx)
 
 			newSess.repoParams, err = newSess.initializeSession(ctx, r.opt.Purpose, r.isReadOnly)
 			if err != nil {
@@ -968,6 +995,14 @@ func (r *grpcRepositoryClient) killInnerSession() {
 
 	if r.innerSession != nil {
 		r.innerSession.cli.CloseSend() //nolint:errcheck
+
+		// Cancel the session context to interrupt any blocked Recv() calls in readLoop.
+		// This prevents readLoop from hanging the entire GRPC client if the connection
+		// breaks unexpectedly (e.g., during system sleep).
+		if r.sessionCancel != nil {
+			r.sessionCancel()
+		}
+
 		r.innerSession.wg.Wait()
 		r.innerSession = nil
 	}
@@ -985,6 +1020,8 @@ func newGRPCAPIRepositoryForConnection(
 		opt.OnUpload = func(_ int64) {}
 	}
 
+	wakeupMgr := wakeevents.New()
+
 	rr := &grpcRepositoryClient{
 		immutableServerRepositoryParameters: par,
 		conn:                                conn,
@@ -993,7 +1030,24 @@ func newGRPCAPIRepositoryForConnection(
 		isReadOnly:                          par.cliOpts.ReadOnly,
 		asyncWritesWG:                       new(errgroup.Group),
 		findManifestsPageSize:               defaultFindManifestsPageSize,
+		wakeupManager:                       wakeupMgr,
 	}
+
+	// Register callback to kill the inner session when the system wakes from sleep.
+	// This ensures we immediately reconnect to the repository instead of waiting for
+	// the next operation to fail and trigger a retry.
+	wakeupMgr.OnWake(func() {
+		rr.killInnerSession()
+	})
+
+	// Start monitoring for wake events.
+	wakeupMgr.Start(ctx)
+
+	// Register cleanup to stop the wake event monitor when the connection closes.
+	par.registerEarlyCloseFunc(func(_ context.Context) error {
+		wakeupMgr.Stop()
+		return nil
+	})
 
 	return inSessionWithoutRetry(ctx, rr, func(ctx context.Context, sess *grpcInnerSession) (*grpcRepositoryClient, error) {
 		p := sess.repoParams
