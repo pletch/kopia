@@ -22,6 +22,9 @@ import {
   getNotificationLevel,
   LevelDisabled,
   LevelWarningsAndErrors,
+  initializeNotifications,
+  showNotification,
+  resetTrayStatusAfterDelay,
 } from "./notifications.js";
 import { serverForRepo } from "./server.js";
 import {
@@ -512,6 +515,51 @@ app.on("ready", () => {
   );
 
   tray.setToolTip("Kopia");
+
+  // Initialize notification system with tray and icon paths
+  // Note: Error/warning icon variants can be added later by creating:
+  // - resources/win/icons/kopia-tray-error.ico
+  // - resources/win/icons/kopia-tray-warning.ico
+  // - resources/linux/icons/kopia-tray-error.png
+  // - resources/linux/icons/kopia-tray-warning.png
+  const normalIcon = path.join(
+    iconsPath(),
+    selectByOS({
+      mac: "kopiaTrayTemplate.png",
+      win: "kopia-tray.ico",
+      linux: "kopia-tray.png",
+    }),
+  );
+
+  const trayIcons = {
+    normal: normalIcon,
+    error: normalIcon, // Falls back to normal icon for now
+    warning: normalIcon,
+  };
+
+  initializeNotifications(tray, trayIcons);
+
+  // Listen for notifications from repository servers
+  ipcMain.on("repo-notification-event", (event, args) => {
+    const { repoID, notification } = args;
+    log.info(
+      `Received notification from repo ${repoID}:`,
+      notification,
+    );
+
+    // Show the desktop toast notification
+    showNotification(notification, { updateTray: true });
+
+    // If it's an error, keep the error message in the tray tooltip
+    // Otherwise reset to normal after a short delay
+    if (
+      notification.type === "error" ||
+      notification.type === "warning"
+    ) {
+      const resetDelay = notification.type === "error" ? 15000 : 7000;
+      resetTrayStatusAfterDelay(resetDelay);
+    }
+  });
 
   // hooks exposed to tests
   if (process.env["KOPIA_UI_TESTING"]) {
